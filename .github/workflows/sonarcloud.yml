@@ -1,0 +1,117 @@
+name: "SonarCloud Analysis"
+on:
+  push:
+    branches: [ "master" ]
+  workflow_dispatch: {}
+
+jobs:
+  sonar-scan:
+    name: SonarCloud Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detectar a Raiz do Projeto (por Atividade Recente)
+        id: find-root
+        shell: bash
+        run: |
+          LATEST_TIMESTAMP=0
+          PROJECT_DIR="."
+          ALL_PROJECTS=$(find . -name "settings.gradle" -o -name "settings.gradle.kts")
+          if [ -n "$ALL_PROJECTS" ]; then
+            for settings_file in $ALL_PROJECTS; do
+              current_dir=$(dirname "$settings_file")
+              timestamp=$(git log -1 --format=%ct -- "$current_dir" || echo 0)
+              if [ "$timestamp" -gt "$LATEST_TIMESTAMP" ]; then
+                LATEST_TIMESTAMP=$timestamp
+                PROJECT_DIR=$current_dir
+              fi
+            done
+          fi
+          echo "Projeto principal selecionado: $PROJECT_DIR"
+          echo "PROJECT_PATH=$PROJECT_DIR" >> $GITHUB_ENV
+
+      # Passo para determinar a versão do Java (lógica mantida, pois é boa)
+      - name: Determine Java Version
+        id: determine_java
+        working-directory: ${{ env.PROJECT_PATH }}
+        shell: bash
+        run: |
+          JAVA_VERSION='17' # Padrão moderno
+          PROPERTIES_FILE="gradle/wrapper/gradle-wrapper.properties"
+          echo "Procurando por $PROPERTIES_FILE..."
+          if [ -f "$PROPERTIES_FILE" ]; then
+            echo "Arquivo encontrado. Tentando extrair a versão do Gradle."
+            GRADLE_VERSION=$(grep -oP 'gradle-\\K[0-9.]*(?=-)' "$PROPERTIES_FILE")
+            echo "Versão do Gradle extraída: [$GRADLE_VERSION]"
+            if [[ "$GRADLE_VERSION" == 4.* ]] || [[ "$GRADLE_VERSION" == 3.* ]] || [[ "$GRADLE_VERSION" == 2.* ]]; then
+              echo "Gradle legacy (v$GRADLE_VERSION) detectado. Forçando o uso do Java 8."
+              JAVA_VERSION='8'
+            else
+              echo "Gradle moderno (v$GRADLE_VERSION ou desconhecido). Usando Java 17."
+            fi
+          else
+            echo "Arquivo $PROPERTIES_FILE não encontrado. Mantendo Java 17 como padrão."
+          fi
+          echo "Versão do Java selecionada para o proximo passo: $JAVA_VERSION"
+          echo "JAVA_VERSION=$JAVA_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Set up JDK
+        uses: actions/setup-java@v3
+        with:
+          java-version: ${{ steps.determine_java.outputs.JAVA_VERSION }}
+          distribution: 'temurin'
+
+      # =============================================================================
+      # CORRIGIDO: Passo de Build e Análise
+      # 1. Cria o init.gradle em vez de modificar o build.gradle do projeto.
+      # 2. Usa 'set -e' para garantir que o passo falhe se o build falhar (sem falso positivo).
+      # 3. Adiciona o parâmetro --init-script na chamada do gradlew.
+      # =============================================================================
+      - name: Build and Analyze with Gradle
+        working-directory: ${{ env.PROJECT_PATH }}
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        shell: bash
+        run: |
+          # Garante que o script pare no primeiro erro
+          set -e
+
+          # Cria o script de inicialização do Gradle em um arquivo temporário
+          echo "Criando script de inicialização do Gradle..."
+          echo -e "
+allprojects {
+    apply plugin: \"org.sonarqube\"
+    sonarqube {
+        properties {
+            property \"sonar.projectKey\", \"grilo-org_20250730T150019_bublitz_android-je\"
+            property \"sonar.organization\", \"grilo-org\"
+            property \"sonar.host.url\", \"https://sonarcloud.io\"
+            property \"sonar.sources\", \".\"
+            property \"sonar.login\", System.getenv(\"SONAR_TOKEN\")
+        }
+    }
+}
+" > /tmp/init.gradle
+          
+          # Verifica se existe um executável do gradlew
+          if [ -f "./gradlew" ]; then
+            echo "Arquivo ./gradlew encontrado. Tornando-o executável."
+            chmod +x ./gradlew
+            
+            echo "Iniciando build e análise com o wrapper do Gradle..."
+            # Executa o build e a análise usando o init script
+            # Removemos o '||' para que o erro do build cause a falha do passo
+            ./gradlew build sonarqube --init-script /tmp/init.gradle -x test
+            
+          else
+            echo "ERRO: O arquivo ./gradlew não foi encontrado no projeto."
+            # Força a falha do passo se o gradlew não existir
+            exit 1
+          fi
+
+          echo "Build e análise concluídos com sucesso."
+
